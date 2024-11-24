@@ -2,6 +2,9 @@ import email
 from flask import Flask, request, jsonify
 import smtplib
 import imaplib
+from flask_login import LoginManager, login_user, UserMixin, logout_user
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required
+
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -11,7 +14,7 @@ from email.header import decode_header
 from email import encoders
 from werkzeug.security import check_password_hash  # For password verification
 import jwt  # PyJWT library for JWT generation
-import datetime
+# import datetime
 from sqlalchemy.exc import IntegrityError
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import UserMixin
@@ -21,7 +24,7 @@ from pymongo import MongoClient  # New import for MongoDB
 from sqlalchemy.exc import SQLAlchemyError  # For handling database errors
 import os
 app = Flask(__name__)
-
+jwt = JWTManager(app)  # Initialize JWTManager after app config
 # MariaDB configuration
 app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+pymysql://root:Admin!123@localhost/vmail'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -46,8 +49,10 @@ class User(UserMixin, db.Model):
 
 class Mailbox(db.Model):
     __tablename__ = 'mailbox'  # Table name in MySQL
+    id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(120), primary_key=True)  # Primary key on username
     password = db.Column(db.String(255), nullable=False)
+    pwdbcrypt = db.Column(db.String(255), nullable=False)
 
 class EmailLog(db.Model):
     __tablename__ = 'emaillog'  # Table name in MySQL
@@ -59,7 +64,7 @@ class EmailLog(db.Model):
     body = db.Column(db.Text, nullable=False)
     body_format = db.Column(db.String(50), default='plain')
     attachments = db.Column(db.Text, nullable=True)  # Comma-separated filenames
-    sent_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    sent_at = db.Column(db.DateTime, default=datetime)
 
 
 BASE_MAILDIR = "/var/vmail/vmail1"
@@ -175,6 +180,31 @@ def log_email_to_mongo(sender, recipient, subject, body):
     }
     mongo_collection = mongo_db['email_logs']
     mongo_collection.insert_one(email_log)
+
+# API Endpoint for user login
+# Login route
+@app.route('/api/login', methods=['POST'])
+def login():
+    try:
+        data = request.json
+        username = data.get('username')
+        password = data.get('password')
+
+        # Find the user in the database
+        user = Mailbox.query.filter_by(username=username).first()
+        
+        if user and check_ssha512_password(user.password, password):
+            # Generate a JWT token
+            token = create_access_token(identity=user.id, expires_delta=timedelta(hours=1))
+            return jsonify({'message': 'Login successful', 'token': token, 'userId': user.id,'bcrypt':user.pwdbcrypt}), 200
+        
+        return jsonify({'message': 'Invalid credentials'}), 401
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
+
+
+
 
 # API to fetch inbox or spam emails (JWT-protected)
 @app.route('/api/get-mails', methods=['POST'])
@@ -303,7 +333,7 @@ def send_email():
         mongo_collection = mongo_db['send_mails']
         mongo_collection.insert_one(email_data)
 
-        return jsonify({'message': 'Email sent successfully!'})
+        return jsonify({'message': 'Email sent successfully!','status':200}),200
 
     except smtplib.SMTPAuthenticationError as auth_error:
         return jsonify({'error': f'Authentication failed: {auth_error}'}), 401
