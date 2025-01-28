@@ -40,7 +40,7 @@ from urllib.parse import quote
 import stat
 import shutil
 from bson import ObjectId
-
+from urllib.parse import unquote
 from libs import iredutils, iredpwd,form_utils
 import settings
 from libs.l10n import TIMEZONES
@@ -1081,7 +1081,7 @@ def send_email():
     cc_email = request.form.get('cc_email')
     subject = request.form.get('subject')
     body = request.form.get('body')
-    body_format = request.form.get('body_format', 'plain')
+    body_format = request.form.get('body_format', 'html')
     print(to_email)
     if not mail_username or not plain_password or not to_email or not subject or not body:
         return jsonify({'error': 'Missing required parameters'}), 400
@@ -1141,14 +1141,14 @@ def send_email():
         # Send the email
         server.sendmail(mail_username, recipients, msg.as_string())
         server.quit()
-
+        encrypted_body = cipher.encrypt(body.encode()).decode()
         # Log the email details in MySQL/MariaDB
         email_entry = EmailLog(
             username=mail_username,
             to_email=', '.join(to_emails),
             cc_email=', '.join(cc_emails) if cc_email else None,
             subject=subject,
-            body=body,
+            body=encrypted_body,
             body_format=body_format,
             attachments=', '.join(attachment_filenames) if attachment_filenames else None,
             sent_at=datetime.utcnow()
@@ -1162,7 +1162,7 @@ def send_email():
             "to_email": to_emails,
             "cc_email": cc_emails,
             "subject": subject,
-            "body": body,
+            "body": encrypted_body,
             "body_format": body_format,
             "attachments": attachment_filenames,
             "sent_at": datetime.utcnow()
@@ -1603,6 +1603,87 @@ def folder_name_api():
     result = get_folder_name(email_address)
     return jsonify(result)
 
+# @app.route("/api/get-emails", methods=["GET"])
+# @jwt_required()
+# def get_emails_by_user():
+#     """
+#     API to get emails based on the email address with decryption for specific fields.
+#     """
+#     email_address = request.args.get("email")
+#     if not email_address:
+#         return jsonify({"error": "Email address is required."}), 400
+    
+#     mongo_db = mongo_client['mail_database']
+#     mongo_collection = mongo_db['emails']
+#     fields_to_encrypt = ["html_body"]  # Fields that need decryption
+
+#     # Define a helper function to convert MongoDB documents to JSON-serializable format
+#     def serialize_document(document):
+#         if isinstance(document, list):
+#             return [serialize_document(doc) for doc in document]
+#         elif isinstance(document, dict):
+#             return {
+#                 key: str(value) if isinstance(value, ObjectId) else value
+#                 for key, value in document.items()
+#             }
+#         return document
+
+#     # Decrypt specified fields if they exist
+#     def decrypt_fields(document):
+#         decrypted_document = {}
+#         for key, value in document.items():
+#             if key in fields_to_encrypt and isinstance(value, str):
+#                 try:
+#                     decrypted_document[key] = cipher.decrypt(value.encode()).decode()
+#                 except Exception as e:
+#                     print(f"Failed to decrypt field '{key}': {e}")
+#                     decrypted_document[key] = value  # Return encrypted data if decryption fails
+#             else:
+#                 decrypted_document[key] = value
+#         return decrypted_document
+
+#     results = mongo_collection.find({"to": email_address}).sort("date", -1)
+    
+#     documents = []
+#     for result in results:
+#         serialized_doc = serialize_document(result)
+#         decrypted_doc = decrypt_fields(serialized_doc)
+#         documents.append(decrypted_doc)
+
+#     # print("Decrypted Data:")
+#     # print(json.dumps(documents, indent=2, default=json_util.default))
+#      # Process and rename fields
+#     formatted_result = [
+#         {
+#             "subject": doc["subject"],
+#             "from": doc["from"],
+#             "to": doc["to"],
+#             "date": doc["date"],
+#             "msgId": doc["msgId"]
+            
+#         }
+#         for doc in documents
+#     ]
+#     # print("Decrypted Data:")
+#     # print(json.dumps(documents, indent=2, default=json_util.default))
+    
+#     return jsonify(formatted_result)
+
+# Helper function to safely decode email headers
+def decode_header_safely(header_value):
+    try:
+        decoded_parts = decode_header(header_value)
+        decoded_header = ''.join(
+            str(part[0], part[1] or 'utf-8') if isinstance(part[0], bytes) else part[0]
+            for part in decoded_parts
+        )
+        return decoded_header
+    except Exception as e:
+        print(f"Error decoding header: {e}")
+        return header_value  # Return raw value if decoding fails
+
+
+# API to get emails by user
 @app.route("/api/get-emails", methods=["GET"])
 @jwt_required()
 def get_emails_by_user():
@@ -1613,6 +1694,7 @@ def get_emails_by_user():
     if not email_address:
         return jsonify({"error": "Email address is required."}), 400
     
+    # Access MongoDB collection
     mongo_db = mongo_client['mail_database']
     mongo_collection = mongo_db['emails']
     fields_to_encrypt = ["html_body"]  # Fields that need decryption
@@ -1638,35 +1720,123 @@ def get_emails_by_user():
                 except Exception as e:
                     print(f"Failed to decrypt field '{key}': {e}")
                     decrypted_document[key] = value  # Return encrypted data if decryption fails
+            elif key in ["subject", "from", "to"] and isinstance(value, str):
+                decrypted_document[key] = decode_header_safely(value)
             else:
                 decrypted_document[key] = value
         return decrypted_document
 
+    # Fetch and process emails
     results = mongo_collection.find({"to": email_address}).sort("date", -1)
-    
     documents = []
     for result in results:
         serialized_doc = serialize_document(result)
         decrypted_doc = decrypt_fields(serialized_doc)
         documents.append(decrypted_doc)
 
-    # print("Decrypted Data:")
-    # print(json.dumps(documents, indent=2, default=json_util.default))
-     # Process and rename fields
+    # Format the results
     formatted_result = [
         {
-            "subject": doc["subject"],
-            "from": doc["from"],
-            "to": doc["to"],
-            "date": doc["date"],
-            "msgId": doc["msgId"]
-            
+            "subject": decode_header_safely(doc.get("subject", "")),
+            "from": decode_header_safely(doc.get("from", "")),
+            "to": decode_header_safely(doc.get("to", "")),
+            "date": doc.get("date"),
+            "msgId": doc.get("message_id")
         }
         for doc in documents
     ]
-    # print("Decrypted Data:")
-    # print(json.dumps(documents, indent=2, default=json_util.default))
-    
+
+    return jsonify(formatted_result)
+# API to sent emails by user
+@app.route("/api/sent-emails", methods=["GET"])
+@jwt_required()
+def sent_emails_by_user():
+    """
+    API to get emails based on the email address with decryption for specific fields.
+    """
+    email_address = request.args.get("email")
+    if not email_address:
+        return jsonify({"error": "Email address is required."}), 400
+    print(email_address)
+    # Access MongoDB collection
+    mongo_db = mongo_client['vmail']
+    mongo_collection = mongo_db['send_mails']
+    fields_to_encrypt = ["body"]  # Fields that need decryption
+
+    # Define a helper function to convert MongoDB documents to JSON-serializable format
+    def serialize_document(document):
+        if isinstance(document, list):
+            return [serialize_document(doc) for doc in document]
+        elif isinstance(document, dict):
+            return {
+                key: str(value) if isinstance(value, ObjectId) else value
+                for key, value in document.items()
+            }
+        return document
+
+    # Decrypt specified fields if they exist
+    def decrypt_fields(document):
+        decrypted_document = {}
+        for key, value in document.items():
+            if key in fields_to_encrypt and isinstance(value, str):
+                try:
+                    decrypted_document[key] = cipher.decrypt(value.encode()).decode()
+                except Exception as e:
+                    print(f"Failed to decrypt field '{key}': {e}")
+                    decrypted_document[key] = value  # Return encrypted data if decryption fails
+            elif key in ["subject", "from", "to"] and isinstance(value, str):
+                decrypted_document[key] = decode_header_safely(value)
+            else:
+                decrypted_document[key] = value
+        return decrypted_document
+    print(str(email_address))
+    # Fetch and process emails
+    # Query MongoDB for documents associated with the username (email address)
+    results = mongo_collection.find({"username": email_address}).sort("sent_at", -1)
+    result_list = list(results)  # Convert cursor to a list
+    print(f"Number of results: {len(result_list)}")
+    # Initialize an empty list for formatted documents
+    formatted_result = []
+    # results_list = list(results)
+    print("list of result")
+    print(result_list)
+    # Iterate through the query results
+    for result in result_list:
+        print("result")
+        print(result)
+        # Serialize the document (if required)
+        serialized_doc = serialize_document(result)
+
+        # Decrypt fields in the document (if required)
+        decrypted_doc = decrypt_fields(serialized_doc)
+
+        # Append the formatted JSON object to the result list
+        formatted_result.append({
+            "from": decrypted_doc.get("username", ""),
+            "to": decrypted_doc.get("to_email", []),
+            "cc": decrypted_doc.get("cc_email", []),
+            "subject": decrypted_doc.get("subject", ""),
+            "body": decrypted_doc.get("body", ""),
+            "date": decrypted_doc.get("sent_at", ""),
+            "attachments": decrypted_doc.get("attachments", [])
+        })
+
+    # If no documents are found, create a placeholder JSON response
+    if not formatted_result:
+        formatted_result.append({
+            "from": email_address,
+            "to": ["placeholder@example.com"],
+            "cc": [],
+            "subject": "No Subject",
+            "body": "No body content available.",
+            "date": "N/A",
+            "attachments": []
+        })
+
+    # Print the formatted JSON for debugging
+    print("Formatted Result:", formatted_result)
+
+    # Return the result as a JSON response
     return jsonify(formatted_result)
 
 
@@ -1677,6 +1847,8 @@ def get_emails_by_msgId():
     API to get emails based on the email address with decryption for specific fields.
     """
     msgId = request.args.get("msgId")
+    print(msgId)
+    encoded_msgId = quote(msgId)
     if not msgId:
         return jsonify({"error": "Email address is required."}), 400
     
@@ -1708,32 +1880,66 @@ def get_emails_by_msgId():
             else:
                 decrypted_document[key] = value
         return decrypted_document
-
-    results = mongo_collection.find({"msgId": msgId},{"subject": 1, "from": 1,"date": 1,"to": 1,"msgId": 1,"html_body": 1, "_id": 0})
+    decoded_msgId = unquote(encoded_msgId)
+    results = mongo_collection.find({"message_id": decoded_msgId},{"subject": 1, "from": 1,"date": 1,"to": 1,"msgId": 1,"html_body": 1, "_id": 0})
     
+    print("Raw Results from MongoDB:")
+    print(results)
+
     documents = []
     for result in results:
-        serialized_doc = serialize_document(result)
-        decrypted_doc = decrypt_fields(serialized_doc)
-        documents.append(decrypted_doc)
+        try:
+            print("Original Document:", result)
+            serialized_doc = serialize_document(result)
+            print("Serialized Document:", serialized_doc)
+            decrypted_doc = decrypt_fields(serialized_doc)
+            print("Decrypted Document:", decrypted_doc)
+            documents.append(decrypted_doc)
+        except Exception as e:
+            print(f"Error processing document: {result}. Skipping this document. Error: {e}")
 
-    # Process and rename fields
+    print("Final Processed Documents List:")
+    print(documents)
+
+    # If documents is empty, fallback to raw results
+    fallback_data = [
+        {
+            "subject": result.get("subject", "No Subject"),
+            "from": result.get("from", "No Sender"),
+            "to": result.get("to", "No Recipient"),
+            "date": result.get("date", "No Date"),
+            "msgId": result.get("msgId", f"Generated-{uuid.uuid4()}"),
+            "htmlBody": result.get("html_body", "No HTML Body")
+        }
+        for result in results
+    ]
+
+    # Final formatted result
     formatted_result = [
         {
-            "subject": doc["subject"],
-            "from": doc["from"],
-            "to": doc["to"],
-            "date": doc["date"],
-            "msgId": doc["msgId"],
-            "htmlBody": doc["html_body"]
-            
+            "subject": doc.get("subject", "No Subject"),
+            "from": doc.get("from", "No Sender"),
+            "to": doc.get("to", "No Recipient"),
+            "date": doc.get("date", "No Date"),
+            "msgId": doc.get("msgId", f"Generated-{uuid.uuid4()}"),
+            "htmlBody": doc.get("html_body", "No HTML Body")
         }
         for doc in documents
     ]
-    # print("Decrypted Data:")
-    # print(json.dumps(documents, indent=2, default=json_util.default))
-    
-    return jsonify(formatted_result)
+
+    # Use processed documents if available, otherwise fallback to raw data
+    if documents:
+        return jsonify({
+            "status": "success",
+            "message": "Data processed and retrieved successfully.",
+            "data": formatted_result
+        }), 200
+    else:
+        return jsonify({
+            "status": "partial",
+            "message": "No processed data available. Returning raw MongoDB results.",
+            "data": fallback_data
+        }), 200
 
 
 
